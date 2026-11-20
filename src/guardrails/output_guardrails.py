@@ -4,15 +4,66 @@ Checkpoint 2 — Output Guardrails
   - OutputGuardrailPlugin (ADK)           ← bắt buộc
   - LLM-as-Judge                          ← optional (không chấm)
 """
+import base64
+import binascii
+import codecs
 import re
 import textwrap
+import unicodedata
 
 from google.genai import types
 from google.adk.agents import llm_agent
 from google.adk import runners
 from google.adk.plugins import base_plugin
 
+from core.config import DEMO_SECRETS
 from core.utils import chat_with_agent
+
+_B64_TOKEN = re.compile(r"[A-Za-z0-9+/_-]{8,}={0,2}")
+_HEX_TOKEN = re.compile(r"(?:[0-9a-fA-F]{2}[\s:-]?){6,}")
+
+
+def _normalize_output(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", text or "")
+    return "".join(ch for ch in normalized if unicodedata.category(ch) != "Cf")
+
+
+def _squash(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (text or "").casefold())
+
+
+def _contains_obfuscated_secret(text: str) -> bool:
+    """Detect protected secrets even when spaced, reversed, ROT13, Base64, or hex-encoded."""
+    base = _normalize_output(text)
+    needles = [n for n in (_squash(s) for s in DEMO_SECRETS) if n]
+    if not base or not needles:
+        return False
+
+    views = [base, base[::-1], codecs.decode(base, "rot_13")]
+    for token in _B64_TOKEN.findall(base):
+        padded = token.replace("-", "+").replace("_", "/")
+        padded += "=" * (-len(padded) % 4)
+        try:
+            decoded = base64.b64decode(padded).decode("utf-8", errors="ignore")
+        except (binascii.Error, ValueError):
+            continue
+        if decoded:
+            views.extend([decoded, decoded[::-1]])
+    for token in _HEX_TOKEN.findall(base):
+        digits = re.sub(r"[^0-9a-fA-F]", "", token)
+        digits = digits[: len(digits) - (len(digits) % 2)]
+        try:
+            decoded = bytes.fromhex(digits).decode("utf-8", errors="ignore")
+        except ValueError:
+            continue
+        if decoded:
+            views.extend([decoded, decoded[::-1]])
+
+    for view in views:
+        squashed = _squash(view)
+        if any(needle in squashed for needle in needles):
+            return True
+    return False
 
 
 # ============================================================
@@ -37,23 +88,31 @@ def content_filter(response: str) -> dict:
         dict with 'safe', 'issues', and 'redacted' keys
     """
     issues = []
-    redacted = response
+    redacted = response or ""
 
-    # PII patterns to check
+    # PII & secret patterns (boundary-safe so 12-digit CCCD is not misread as phone)
     PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+        "phone": r"(?<!\d)(?:\+84|0)\d{9,10}(?!\d)",
+        "email": r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}",
+        "national_id": r"(?<!\d)(?:\d{12}|\d{9})(?!\d)",
+        "api_key": r"\bsk-[a-zA-Z0-9_-]{4,}\b",
+        "password": r"(?:(?:password|passwd|pwd|mật\s*khẩu)\s*(?:[:=]|\bis\b|\blà\b)\s*[^\s,;\"'()]+|\badmin123\b)",
+        "internal_db": r"\bdb\.vinbank\.internal(?::\d+)?\b",
     }
 
     for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
+        matches = re.findall(pattern, redacted, re.IGNORECASE)
         if matches:
             issues.append(f"{name}: {len(matches)} found")
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+
+    # Hard fail-closed shield against obfuscated secrets (base64, hex, ROT13, reversed, spaced)
+    if _contains_obfuscated_secret(redacted):
+        issues.append("protected_secret: obfuscated secret detected")
+        redacted = (
+            "I cannot share internal system details. [REDACTED] "
+            "How else can I help with your VinBank banking needs?"
+        )
 
     return {
         "safe": len(issues) == 0,
@@ -149,6 +208,7 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         self.blocked_count = 0
         self.redacted_count = 0
         self.total_count = 0
+        self.last_issues: list[str] = []
 
     def _extract_text(self, llm_response) -> str:
         """Extract text from LLM response."""
@@ -167,21 +227,39 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
     ):
         """Check LLM response before sending to user."""
         self.total_count += 1
+        self.last_issues = []
 
         response_text = self._extract_text(llm_response)
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        filtered = content_filter(response_text)
+        current_text = filtered["redacted"]
+        if not filtered["safe"]:
+            self.redacted_count += 1
+            self.last_issues = list(filtered["issues"])
+            if any("protected_secret" in issue for issue in filtered["issues"]):
+                self.blocked_count += 1
+            llm_response.content = types.Content(
+                role="model",
+                parts=[types.Part.from_text(text=current_text)],
+            )
 
-        return llm_response  # TODO: modify if needed
+        if self.use_llm_judge:
+            judge_result = await llm_safety_check(current_text)
+            if not judge_result.get("safe", True):
+                self.blocked_count += 1
+                self.last_issues.append("llm_judge_unsafe")
+                safe_msg = (
+                    "I cannot provide that response. "
+                    "How else can I help with your VinBank banking needs?"
+                )
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[types.Part.from_text(text=safe_msg)],
+                )
+
+        return llm_response
 
 
 # ============================================================
